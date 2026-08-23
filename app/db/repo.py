@@ -358,37 +358,91 @@ def add_source_ref(org_id: str, lead_id: str, source: str, source_url: str | Non
         "collected_at": now_iso(), "last_verified_at": now_iso(),
     })
 
-def upsert_fact(org_id: str, lead_id: str, key: str, value: str, source: str,
-                source_url: str | None, confidence: float) -> None:
+def upsert_fact(
+    org_id: str,
+    lead_id: str,
+    key: str,
+    value: str,
+    source: str,
+    source_url: str | None,
+    confidence: float,
+) -> None:
+    """Atomically insert or update a lead fact."""
     owned_lead(org_id, lead_id)
-    row = db.one("SELECT id FROM lead_facts WHERE lead_id = ? AND fact_key = ? AND source = ?",
-                 (lead_id, key, source))
-    payload = {"fact_value": value, "source_url": source_url, "confidence": confidence,
-               "checked_at": now_iso()}
-    if row:
-        db.update("lead_facts", payload, "id = ?", (row[0],))
-    else:
-        db.insert("lead_facts", {"id": new_id("fact"), "lead_id": lead_id, "fact_key": key,
-                                 "source": source, **payload})
 
-def upsert_signal(org_id: str, lead_id: str, signal: str, source: str, *, polarity: str = "positive",
-                  source_url: str | None = None, evidence: str | None = None,
-                  confidence: float = 0.5) -> bool:
-    """Returns True when the signal is new for this lead+source."""
+    now = now_iso()
+
+    db.execute(
+        "INSERT INTO lead_facts "
+        "(id, lead_id, fact_key, fact_value, source, source_url, confidence, checked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(lead_id, fact_key, source) DO UPDATE SET "
+        "fact_value = excluded.fact_value, "
+        "source_url = excluded.source_url, "
+        "confidence = excluded.confidence, "
+        "checked_at = excluded.checked_at",
+        (
+            new_id("fact"),
+            lead_id,
+            key,
+            value,
+            source,
+            source_url,
+            confidence,
+            now,
+        ),
+    )
+def upsert_signal(
+    org_id: str,
+    lead_id: str,
+    signal: str,
+    source: str,
+    *,
+    polarity: str = "positive",
+    source_url: str | None = None,
+    evidence: str | None = None,
+    confidence: float = 0.5,
+) -> bool:
+    """Atomically insert or update a lead signal.
+
+    Returns True when a new signal is inserted and False when an existing
+    (lead_id, signal, source) row is updated.
+    """
     owned_lead(org_id, lead_id)
-    row = db.one("SELECT id FROM lead_signals WHERE lead_id = ? AND signal = ? AND source = ?",
-                 (lead_id, signal, source))
-    if row:
-        db.update("lead_signals", {"confidence": confidence, "evidence": evidence,
-                                  "detected_at": now_iso()}, "id = ?", (row[0],))
-        return False
-    db.insert("lead_signals", {
-        "id": new_id("sig"), "lead_id": lead_id, "signal": signal, "polarity": polarity,
-        "source": source, "source_url": source_url, "evidence": evidence,
-        "confidence": confidence, "detected_at": now_iso(),
-    })
-    return True
 
+    now = now_iso()
+
+    existing = db.one(
+        "SELECT id FROM lead_signals "
+        "WHERE lead_id = ? AND signal = ? AND source = ?",
+        (lead_id, signal, source),
+    )
+
+    db.execute(
+        "INSERT INTO lead_signals "
+        "(id, lead_id, signal, polarity, source, source_url, evidence, "
+        "confidence, detected_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(lead_id, signal, source) DO UPDATE SET "
+        "polarity = excluded.polarity, "
+        "source_url = excluded.source_url, "
+        "evidence = excluded.evidence, "
+        "confidence = excluded.confidence, "
+        "detected_at = excluded.detected_at",
+        (
+            new_id("sig"),
+            lead_id,
+            signal,
+            polarity,
+            source,
+            source_url,
+            evidence,
+            confidence,
+            now,
+        ),
+    )
+
+    return existing is None
 def save_score(org_id: str, lead_id: str, score: int, reasons: list[str], confidence: float,
                weights_version: str, ai_adjustment: int = 0) -> str:
     owned_lead(org_id, lead_id)
@@ -402,16 +456,32 @@ def save_score(org_id: str, lead_id: str, score: int, reasons: list[str], confid
 
 def save_website_analysis(org_id: str, lead_id: str, row: dict) -> str:
     owned_lead(org_id, lead_id)
+
     wid = new_id("wa")
     payload = dict(row)
+
+    # PostgreSQL schema stores these fields as INTEGER for SQLite/PostgreSQL
+    # portability. SQLite silently accepts bool as 0/1, PostgreSQL does not.
+    for key in ("reachable", "https"):
+        if key in payload and payload[key] is not None:
+            payload[key] = 1 if bool(payload[key]) else 0
+
+    if "ssl_valid" in payload and payload["ssl_valid"] is not None:
+        payload["ssl_valid"] = 1 if bool(payload["ssl_valid"]) else 0
+
     payload["scores"] = dumps(payload.get("scores") or {})
     payload["facts"] = dumps(payload.get("facts") or [])
     payload["detected"] = dumps(payload.get("detected") or {})
-    payload.update({"id": wid, "lead_id": lead_id})
+
+    payload.update({
+        "id": wid,
+        "lead_id": lead_id,
+    })
+
     payload.setdefault("checked_at", now_iso())
+
     db.insert("website_analyses", payload)
     return wid
-
 def _child_rows(org_id: str, table: str, lead_ids: Iterable[str], order_by: str = "") -> dict[str, list[dict]]:
     """Fetch child rows for the leads this org owns.
 
